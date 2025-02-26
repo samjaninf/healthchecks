@@ -15,44 +15,50 @@ from zoneinfo import ZoneInfo
 from cronsim import CronSim
 from django.conf import settings
 from django.contrib.auth.models import User
+from django.contrib.humanize.templatetags.humanize import naturaltime
 from django.core.mail import mail_admins
 from django.core.signing import TimestampSigner
 from django.db import models, transaction
-from django.db.models import QuerySet
+from django.db.models import F, QuerySet
 from django.http import HttpRequest
 from django.urls import reverse
 from django.utils.functional import cached_property
 from django.utils.timezone import now
+from oncalendar import OnCalendar
 from pydantic import BaseModel, Field
 
 from hc.accounts.models import Project
 from hc.api import transports
 from hc.lib import emails
 from hc.lib.date import month_boundaries, seconds_in_month
-from hc.lib.s3 import get_object, put_object, remove_objects
+from hc.lib.s3 import GetObjectError, get_object, put_object, remove_objects
+from hc.lib.urls import absolute_reverse
 
 STATUSES = (("up", "Up"), ("down", "Down"), ("new", "New"), ("paused", "Paused"))
 DEFAULT_TIMEOUT = td(days=1)
 DEFAULT_GRACE = td(hours=1)
 NEVER = datetime(3000, 1, 1, tzinfo=timezone.utc)
-CHECK_KINDS = (("simple", "Simple"), ("cron", "Cron"))
+CHECK_KINDS = (("simple", "Simple"), ("cron", "Cron"), ("oncalendar", "OnCalendar"))
 # max time between start and ping where we will consider both events related:
 MAX_DURATION = td(hours=72)
+REASONS = (("", "Unknown"), ("timeout", "Timeout"), ("fail", "Fail signal"))
+
 
 TRANSPORTS: dict[str, tuple[str, type[transports.Transport]]] = {
     "apprise": ("Apprise", transports.Apprise),
     "call": ("Phone Call", transports.Call),
     "discord": ("Discord", transports.Discord),
     "email": ("Email", transports.Email),
+    "github": ("GitHub", transports.GitHub),
     "gotify": ("Gotify", transports.Gotify),
-    "hipchat": ("HipChat", transports.RemovedTransport),
+    "group": ("Group", transports.Group),
     "linenotify": ("LINE Notify", transports.LineNotify),
     "matrix": ("Matrix", transports.Matrix),
     "mattermost": ("Mattermost", transports.Mattermost),
-    "msteams": ("Microsoft Teams", transports.MsTeams),
+    "msteams": ("MS Teams Connector (stops working Jan 2025)", transports.MsTeams),
+    "msteamsw": ("Microsoft Teams", transports.MsTeamsWorkflow),
     "ntfy": ("ntfy", transports.Ntfy),
     "opsgenie": ("Opsgenie", transports.Opsgenie),
-    "pagerteam": ("Pager Team", transports.RemovedTransport),
     "pagertree": ("PagerTree", transports.PagerTree),
     "pd": ("PagerDuty", transports.PagerDuty),
     "po": ("Pushover", transports.Pushover),
@@ -68,7 +74,6 @@ TRANSPORTS: dict[str, tuple[str, type[transports.Transport]]] = {
     "victorops": ("Splunk On-Call", transports.VictorOps),
     "webhook": ("Webhook", transports.Webhook),
     "whatsapp": ("WhatsApp", transports.WhatsApp),
-    "zendesk": ("Zendesk", transports.RemovedTransport),
     "zulip": ("Zulip", transports.Zulip),
 }
 
@@ -100,6 +105,7 @@ def isostring(dt: datetime | None) -> str | None:
 
 
 class CheckDict(TypedDict, total=False):
+    uuid: str | None
     name: str
     slug: str
     tags: str
@@ -119,6 +125,7 @@ class CheckDict(TypedDict, total=False):
     failure_kw: str
     filter_subject: bool
     filter_body: bool
+    badge_url: str
     last_duration: int
     unique_key: str
     ping_url: str
@@ -147,7 +154,7 @@ class DowntimeRecord:
         return up_seconds / max_seconds
 
 
-class DowntimeRecorder(object):
+class DowntimeRecorder:
     def __init__(self, boundaries: list[datetime], tz: str, created: datetime) -> None:
         """
         `boundaries` is a list of timezone-aware datetimes of the starts of time
@@ -190,6 +197,7 @@ class Check(models.Model):
     failure_kw = models.CharField(max_length=200, blank=True)
     methods = models.CharField(max_length=30, blank=True)
     manual_resume = models.BooleanField(default=False)
+    badge_key = models.UUIDField(default=uuid.uuid4, unique=True)
 
     n_pings = models.IntegerField(default=0)
     last_ping = models.DateTimeField(null=True, blank=True)
@@ -240,14 +248,15 @@ class Check(models.Model):
         return settings.PING_ENDPOINT + str(self.code)
 
     def details_url(self, full: bool = True) -> str:
-        result = reverse("hc-details", args=[self.code])
-        return settings.SITE_ROOT + result if full else result
+        if not full:
+            return reverse("hc-details", args=[self.code])
+        return absolute_reverse("hc-details", args=[self.code])
 
     def get_absolute_url(self) -> str:
         return self.details_url(full=False)
 
     def cloaked_url(self) -> str:
-        return settings.SITE_ROOT + reverse("hc-uncloak", args=[self.unique_key])
+        return absolute_reverse("hc-uncloak", args=[self.unique_key])
 
     def email(self) -> str:
         return "%s@%s" % (self.code, settings.PING_EMAIL_DOMAIN)
@@ -276,6 +285,20 @@ class Check(models.Model):
             # DST transitions). cronsim will handle the timezone-aware datetimes.
             last_local = self.last_ping.astimezone(ZoneInfo(self.tz))
             result = next(CronSim(self.schedule, last_local))
+            # Important: convert from the local timezone back to UTC.
+            # If the result is kept in the local timezone, adding
+            # a timedelta to it later (in `going_down_after` and in `get_status`)
+            # may yield incorrect results during DST transitions.
+            result = result.astimezone(timezone.utc)
+        elif self.kind == "oncalendar" and self.status == "up":
+            assert self.last_ping is not None
+            last_local = self.last_ping.astimezone(ZoneInfo(self.tz))
+            try:
+                result = next(OnCalendar(self.schedule, last_local))
+                # Same as for cron, convert back to UTC:
+                result = result.astimezone(timezone.utc)
+            except StopIteration:
+                result = NEVER
 
         if with_started and self.last_start and self.status != "down":
             result = min(result, self.last_start)
@@ -294,6 +317,10 @@ class Check(models.Model):
 
         return None
 
+    @cached_property
+    def cached_status(self) -> str:
+        return self.get_status()
+
     def get_status(self, *, with_started: bool = False) -> str:
         """Return current status for display."""
         frozen_now = now()
@@ -308,7 +335,10 @@ class Check(models.Model):
             return self.status
 
         grace_start = self.get_grace_start(with_started=False)
-        assert grace_start is not None
+        if grace_start is None:
+            # next elapse is "never", so this check will stay up indefinitely
+            return "up"
+
         grace_end = grace_start + self.grace
         if frozen_now >= grace_end:
             return "down"
@@ -325,7 +355,7 @@ class Check(models.Model):
         in the process of deletion.
         """
         with transaction.atomic():
-            Check.objects.select_for_update().get(id=self.id).delete()
+            Check.objects.select_for_update().filter(id=self.id).delete()
 
     def assign_all_channels(self) -> None:
         channels = Channel.objects.filter(project=self.project)
@@ -376,6 +406,9 @@ class Check(models.Model):
             "failure_kw": self.failure_kw,
             "filter_subject": self.filter_subject,
             "filter_body": self.filter_body,
+            # Optimization: construct badge URLs manually instead of using reverse().
+            # This is significantly quicker when returning hundreds of checks.
+            "badge_url": f"{settings.SITE_ROOT}/b/2/{self.badge_key}.svg",
         }
 
         if self.last_duration:
@@ -384,11 +417,12 @@ class Check(models.Model):
         if readonly:
             result["unique_key"] = self.unique_key
         else:
+            result["uuid"] = str(self.code)
             result["ping_url"] = settings.PING_ENDPOINT + str(self.code)
 
             # Optimization: construct API URLs manually instead of using reverse().
             # This is significantly quicker when returning hundreds of checks.
-            update_url = settings.SITE_ROOT + f"/api/v{v}/checks/{self.code}"
+            update_url = f"{settings.SITE_ROOT}/api/v{v}/checks/{self.code}"
             result["update_url"] = update_url
             result["pause_url"] = update_url + "/pause"
             result["resume_url"] = update_url + "/resume"
@@ -396,7 +430,7 @@ class Check(models.Model):
 
         if self.kind == "simple":
             result["timeout"] = int(self.timeout.total_seconds())
-        elif self.kind == "cron":
+        elif self.kind in ("cron", "oncalendar"):
             result["schedule"] = self.schedule
             result["tz"] = self.tz
 
@@ -418,6 +452,9 @@ class Check(models.Model):
         # the updated Check object before the Ping object is created.
         # To avoid this, put both operations inside a transaction:
         with transaction.atomic():
+            # Acquire a lock. Without locking, on MariaDB, concurrent pings can
+            # lead to a deadlock
+            self = Check.objects.select_for_update().get(id=self.id)
             frozen_now = now()
 
             if self.status == "paused" and self.manual_resume:
@@ -447,7 +484,8 @@ class Check(models.Model):
 
                 new_status = "down" if action == "fail" else "up"
                 if self.status != new_status:
-                    self.create_flip(new_status)
+                    reason = "fail" if action == "fail" else ""
+                    self.create_flip(new_status, reason=reason)
                     self.status = new_status
 
             self.alert_after = self.going_down_after()
@@ -485,26 +523,40 @@ class Check(models.Model):
         if self.n_pings % 100 == 0:
             self.prune()
 
-    def prune(self) -> None:
+    def prune(self, wait: bool = False) -> None:
         """Remove old pings and notifications."""
 
         threshold = self.n_pings - self.project.owner_profile.ping_log_limit
 
         # Remove ping bodies from object storage
         if settings.S3_BUCKET:
-            remove_objects(str(self.code), threshold)
+            remove_objects(str(self.code), threshold, wait=wait)
 
         # Remove ping objects from db
         self.ping_set.filter(n__lte=threshold).delete()
 
         try:
-            ping = self.ping_set.earliest("id")
+            # Important: sort by "created", not by "id". Sorting by id
+            # may cause Postgres to use the "api_ping_pkey" index, and scan
+            # a huge number of rows.
+            ping = self.ping_set.earliest("created")
+
+            # Delete notifications older than the oldest retained ping
             self.notification_set.filter(created__lt=ping.created).delete()
+
+            # Delete flips older than the oldest retained ping *and*
+            # older than 93 days. We need ~3 months of flips for calculating
+            # downtime statistics. The precise requirement is
+            # "we need the current month and full two previous months of data".
+            # We could calculate this precisely, but 3*31 is close enough and
+            # much simpler.
+            flip_threshold = min(ping.created, now() - td(days=93))
+            self.flip_set.filter(created__lt=flip_threshold).delete()
         except Ping.DoesNotExist:
             pass
 
     @property
-    def visible_pings(self) -> QuerySet["Ping"]:
+    def visible_pings(self) -> QuerySet[Ping]:
         threshold = self.n_pings - self.project.owner_profile.ping_log_limit
         return self.ping_set.filter(n__gt=threshold)
 
@@ -548,7 +600,9 @@ class Check(models.Model):
         boundaries = month_boundaries(months, tz)
         return self.downtimes_by_boundary(boundaries, tz)
 
-    def create_flip(self, new_status: str, mark_as_processed: bool = False) -> None:
+    def create_flip(
+        self, new_status: str, reason: str = "", mark_as_processed: bool = False
+    ) -> None:
         """Create a Flip object for this check.
 
         Flip objects record check status changes, and have two uses:
@@ -565,6 +619,7 @@ class Check(models.Model):
             flip.processed = flip.created
         flip.old_status = self.status
         flip.new_status = new_status
+        flip.reason = reason
         flip.save()
 
 
@@ -591,16 +646,18 @@ class Ping(models.Model):
     remote_addr = models.GenericIPAddressField(blank=True, null=True)
     method = models.CharField(max_length=10, blank=True)
     ua = models.CharField(max_length=200, blank=True)
-    body = models.TextField(blank=True, null=True)
     body_raw = models.BinaryField(null=True)
     object_size = models.IntegerField(null=True)
     exitstatus = models.SmallIntegerField(null=True)
     rid = models.UUIDField(null=True)
 
+    class GetBodyError(Exception):
+        pass
+
     def to_dict(self) -> PingDict:
         if self.has_body():
             args = [self.owner.code, self.n]
-            body_url = settings.SITE_ROOT + reverse("hc-api-ping-body", args=args)
+            body_url = absolute_reverse("hc-api-ping-body", args=args)
         else:
             body_url = None
 
@@ -623,31 +680,45 @@ class Ping(models.Model):
         return result
 
     def has_body(self) -> bool:
-        if self.body or self.body_raw or self.object_size:
+        if self.body_raw or self.object_size:
             return True
 
         return False
 
     def get_body_bytes(self) -> bytes | None:
-        if self.body:
-            return self.body.encode()
         if self.object_size and self.n:
-            return get_object(str(self.owner.code), self.n)
+            # Do not attemt to touch S3 if we have recorded more than 3
+            # errors (503 responses, request timeouts) in the last minute
+            # when accessing S3.
+            # If we don't do this, a S3 outage can clog our requests handlers and
+            # cause a bigger issue.
+            if not TokenBucket.s3_is_healthy():
+                raise self.GetBodyError()
+
+            try:
+                return get_object(str(self.owner.code), self.n)
+            except GetObjectError:
+                # If S3 access resulted in error, record this fact:
+                TokenBucket.record_s3_get_object_error()
+                raise self.GetBodyError()
+
         if self.body_raw:
             return self.body_raw
 
         return None
 
     def get_body(self) -> str | None:
-        body_bytes = self.get_body_bytes()
+        try:
+            body_bytes = self.get_body_bytes()
+        except self.GetBodyError:
+            return None
+
         if body_bytes:
             return bytes(body_bytes).decode(errors="replace")
 
         return None
 
     def get_body_size(self) -> int:
-        if self.body:
-            return len(self.body)
         if self.body_raw:
             return len(self.body_raw)
         if self.object_size:
@@ -688,15 +759,11 @@ class Ping(models.Model):
 
         return None
 
-
-def json_property(kind: str, field: str) -> property:
-    def fget(instance: Channel) -> int | str:
-        assert instance.kind == kind
-        v = instance.json[field]
-        assert isinstance(v, int) or isinstance(v, str)
-        return v
-
-    return property(fget)
+    def formatted_kind_created(self) -> str:
+        """Return a string in "Success, 10 minutes" form."""
+        # xa0 is non-breaking spaces, we want regular spaces
+        created_str = naturaltime(self.created).replace("\xa0", " ")
+        return f"{self.get_kind_display()}, {created_str}"
 
 
 class WebhookSpec(BaseModel):
@@ -756,6 +823,52 @@ class OpsgenieConf(BaseModel):
     region: str
 
 
+class ZulipConf(BaseModel):
+    bot_email: str
+    api_key: str
+    mtype: str
+    to: str
+    site: str = ""
+    topic: str = ""
+
+    def model_post_init(self, context: Any) -> None:
+        if self.site == "":
+            # Fallback if we don't have the site value:
+            # derive it from bot's email
+            _, domain = self.bot_email.split("@")
+            self.site = f"https://{domain}"
+
+
+class NtfyConf(BaseModel):
+    topic: str
+    url: str
+    priority: int
+    priority_up: int
+    token: str = ""
+
+    @property
+    def priority_display(self) -> str:
+        return NTFY_PRIORITIES[self.priority]
+
+
+class TrelloConf(BaseModel):
+    token: str
+    list_id: str
+    board_name: str
+    list_name: str
+
+
+class GitHubConf(BaseModel):
+    installation_id: int
+    repo: str
+    labels: list[str]
+
+
+class GotifyConf(BaseModel):
+    url: str
+    token: str
+
+
 class Channel(models.Model):
     name = models.CharField(max_length=100, blank=True)
     code = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
@@ -774,18 +887,18 @@ class Channel(models.Model):
         if self.name:
             return self.name
         if self.kind == "email":
-            return "Email to %s" % self.email.value
+            return f"Email to {self.email.value}"
         elif self.kind == "sms":
-            return "SMS to %s" % self.phone.value
+            return f"SMS to {self.phone.value}"
         elif self.kind == "slack":
-            return "Slack %s" % self.slack_channel
+            return f"Slack {self.slack_channel}"
         elif self.kind == "telegram":
-            return "Telegram %s" % self.telegram.name
+            return f"Telegram {self.telegram.name}"
         elif self.kind == "zulip":
-            if self.zulip_type == "stream":
-                return "Zulip stream %s" % self.zulip_to
-            if self.zulip_type == "private":
-                return "Zulip user %s" % self.zulip_to
+            if self.zulip.mtype == "stream":
+                return f"Zulip stream {self.zulip.to}"
+            if self.zulip.mtype == "private":
+                return f"Zulip user {self.zulip.to}"
 
         return self.get_kind_display()
 
@@ -793,7 +906,15 @@ class Channel(models.Model):
         return {"id": str(self.code), "name": self.name, "kind": self.kind}
 
     def is_editable(self) -> bool:
-        return self.kind in ("email", "webhook", "sms", "signal", "whatsapp", "ntfy")
+        return self.kind in (
+            "email",
+            "webhook",
+            "sms",
+            "signal",
+            "whatsapp",
+            "ntfy",
+            "group",
+        )
 
     def assign_all_checks(self) -> None:
         checks = Check.objects.filter(project=self.project)
@@ -806,22 +927,20 @@ class Channel(models.Model):
 
     def send_verify_link(self) -> None:
         args = [self.code, self.make_token()]
-        verify_link = reverse("hc-verify-email", args=args)
-        verify_link = settings.SITE_ROOT + verify_link
+        verify_link = absolute_reverse("hc-verify-email", args=args)
         emails.verify_email(self.email.value, {"verify_link": verify_link})
 
     def get_unsub_link(self) -> str:
         signer = TimestampSigner(salt="alerts")
         signed_token = signer.sign(self.make_token())
         args = [self.code, signed_token]
-        verify_link = reverse("hc-unsubscribe-alerts", args=args)
-        return settings.SITE_ROOT + verify_link
+        return absolute_reverse("hc-unsubscribe-alerts", args=args)
 
     def send_signal_captcha_alert(self, challenge: str, raw: str) -> None:
         subject = "Signal CAPTCHA proof required"
         message = f"Challenge token: {challenge}"
         hostname = socket.gethostname()
-        submit_url = settings.SITE_ROOT + reverse("hc-signal-captcha")
+        submit_url = absolute_reverse("hc-signal-captcha")
         submit_url += "?" + urlencode({"host": hostname, "challenge": challenge})
         html_message = f"""
             On host <b>{hostname}</b>, run:<br>
@@ -852,8 +971,8 @@ class Channel(models.Model):
         _, cls = TRANSPORTS[self.kind]
         return cls(self)
 
-    def notify(self, check: Check, is_test: bool = False) -> str:
-        if self.transport.is_noop(check):
+    def notify(self, flip: Flip, is_test: bool = False) -> str:
+        if self.transport.is_noop(flip.new_status):
             return "no-op"
 
         n = Notification(channel=self)
@@ -862,15 +981,16 @@ class Channel(models.Model):
             # (the passed check is a dummy, unsaved Check instance)
             pass
         else:
-            n.owner = check
+            n.owner = flip.owner
 
-        n.check_status = check.status
+        n.check_status = flip.new_status
         n.error = "Sending"
         n.save()
 
         start, error, disabled = now(), "", self.disabled
         try:
-            self.transport.notify(check, notification=n)
+            self.transport.notify(flip, notification=n)
+
         except transports.TransportError as e:
             disabled = True if e.permanent else disabled
             error = e.message
@@ -996,14 +1116,10 @@ class Channel(models.Model):
         assert self.kind in ("call", "sms", "whatsapp", "signal")
         return PhoneConf.model_validate_json(self.value)
 
-    trello_token = json_property("trello", "token")
-    trello_list_id = json_property("trello", "list_id")
-
     @property
-    def trello_board_list(self) -> tuple[str, str]:
+    def trello(self) -> TrelloConf:
         assert self.kind == "trello"
-        doc = json.loads(self.value)
-        return doc["board_name"], doc["list_name"]
+        return TrelloConf.model_validate_json(self.value, strict=True)
 
     @property
     def email(self) -> EmailConf:
@@ -1013,53 +1129,39 @@ class Channel(models.Model):
     def opsgenie(self) -> OpsgenieConf:
         return OpsgenieConf.model_validate_json(self.value)
 
-    zulip_bot_email = json_property("zulip", "bot_email")
-    zulip_api_key = json_property("zulip", "api_key")
-    zulip_type = json_property("zulip", "mtype")
-    zulip_to = json_property("zulip", "to")
+    @property
+    def zulip(self) -> ZulipConf:
+        return ZulipConf.model_validate_json(self.value)
 
     @property
-    def zulip_site(self) -> str:
-        assert self.kind == "zulip"
-        doc = json.loads(self.value)
-        if "site" in doc:
-            return doc["site"]
-
-        # Fallback if we don't have the site value:
-        # derive it from bot's email
-        _, domain = doc["bot_email"].split("@")
-        return "https://" + domain
-
-    @property
-    def zulip_topic(self) -> str:
-        assert self.kind == "zulip"
-        return self.json.get("topic", "")
+    def github(self) -> GitHubConf:
+        return GitHubConf.model_validate_json(self.value)
 
     @property
     def linenotify_token(self) -> str:
         assert self.kind == "linenotify"
         return self.value
 
-    gotify_url = json_property("gotify", "url")
-    gotify_token = json_property("gotify", "token")
-
-    ntfy_topic = json_property("ntfy", "topic")
-    ntfy_url = json_property("ntfy", "url")
-    ntfy_priority = json_property("ntfy", "priority")
-    ntfy_priority_up = json_property("ntfy", "priority_up")
+    @property
+    def gotify(self) -> GotifyConf:
+        assert self.kind == "gotify"
+        return GotifyConf.model_validate_json(self.value, strict=True)
 
     @property
-    def ntfy_token(self) -> str | None:
+    def group_channels(self) -> QuerySet[Channel]:
+        assert self.kind == "group"
+        return Channel.objects.filter(
+            project=self.project, code__in=self.value.split(",")
+        )
+
+    @property
+    def ntfy(self) -> NtfyConf:
         assert self.kind == "ntfy"
-        return self.json.get("token")
-
-    @property
-    def ntfy_priority_display(self) -> str:
-        return NTFY_PRIORITIES[self.ntfy_priority]
+        return NtfyConf.model_validate_json(self.value, strict=True)
 
 
 class Notification(models.Model):
-    code = models.UUIDField(default=uuid.uuid4, null=True, editable=False)
+    code = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
     # owner is null for test notifications, produced by the "Test!" button
     # in the Integrations page
     owner = models.ForeignKey(Check, models.CASCADE, null=True)
@@ -1072,8 +1174,7 @@ class Notification(models.Model):
         get_latest_by = "created"
 
     def status_url(self) -> str:
-        path = reverse("hc-api-notification-status", args=[self.code])
-        return settings.SITE_ROOT + path
+        return absolute_reverse("hc-api-notification-status", args=[self.code])
 
 
 class FlipDict(TypedDict):
@@ -1087,6 +1188,7 @@ class Flip(models.Model):
     processed = models.DateTimeField(null=True, blank=True)
     old_status = models.CharField(max_length=8, choices=STATUSES)
     new_status = models.CharField(max_length=8, choices=STATUSES)
+    reason = models.CharField(max_length=8, choices=REASONS, default="")
 
     class Meta:
         indexes = [
@@ -1096,7 +1198,12 @@ class Flip(models.Model):
                 fields=["processed"],
                 name="api_flip_not_processed",
                 condition=models.Q(processed=None),
-            )
+            ),
+            # For efficiently selecting flips in hc.front.views._get_events
+            models.Index(
+                fields=["owner", "created"],
+                name="api_flip_owner_created",
+            ),
         ]
 
     def to_dict(self) -> FlipDict:
@@ -1110,7 +1217,8 @@ class Flip(models.Model):
 
         * Exclude all channels for new->up and paused->up transitions.
         * Exclude disabled channels
-        * Exclude channels where transport.is_noop(check) returns True
+        * Exclude channels where transport.is_noop(status) returns True
+        * Sort channels by last_notify_duration (shorter durations first)
         """
 
         # Don't send alerts on new->up and paused->up transitions
@@ -1121,7 +1229,15 @@ class Flip(models.Model):
             raise NotImplementedError(f"Unexpected status: {self.new_status}")
 
         q = self.owner.channel_set.exclude(disabled=True)
-        return [ch for ch in q if not ch.transport.is_noop(self.owner)]
+        q = q.order_by(F("last_notify_duration").asc(nulls_last=True))
+        return [ch for ch in q if not ch.transport.is_noop(self.new_status)]
+
+    def reason_long(self) -> str | None:
+        if self.reason == "timeout":
+            return "success signal did not arrive on time, grace time passed"
+        if self.reason == "fail":
+            return "received a failure signal"
+        return None
 
 
 class TokenBucket(models.Model):
@@ -1130,7 +1246,9 @@ class TokenBucket(models.Model):
     updated = models.DateTimeField(default=now)
 
     @staticmethod
-    def authorize(value: str, capacity: int, refill_time_secs: int) -> bool:
+    def authorize(
+        value: str, capacity: int, refill_time_secs: int, force: bool = False
+    ) -> bool:
         frozen_now = now()
         obj, created = TokenBucket.objects.get_or_create(value=value)
 
@@ -1140,7 +1258,7 @@ class TokenBucket(models.Model):
             obj.tokens = min(1.0, obj.tokens + duration_secs / refill_time_secs)
 
         obj.tokens -= 1.0 / capacity
-        if obj.tokens < 0:
+        if obj.tokens < 0 and not force:
             # Not enough tokens
             return False
 
@@ -1175,10 +1293,10 @@ class TokenBucket(models.Model):
         email = mailbox + "@" + domain
 
         salted_encoded = (email + settings.SECRET_KEY).encode()
-        value = "em-%s" % hashlib.sha1(salted_encoded).hexdigest()
+        hashed = hashlib.sha1(salted_encoded).hexdigest()
 
         # 20 login attempts for a single email per hour:
-        return TokenBucket.authorize(value, 20, 3600)
+        return TokenBucket.authorize(f"em-{hashed}", 20, 3600)
 
     @staticmethod
     def authorize_invite(user: User) -> bool:
@@ -1190,25 +1308,23 @@ class TokenBucket(models.Model):
     @staticmethod
     def authorize_login_password(email: str) -> bool:
         salted_encoded = (email + settings.SECRET_KEY).encode()
-        value = "pw-%s" % hashlib.sha1(salted_encoded).hexdigest()
+        hashed = hashlib.sha1(salted_encoded).hexdigest()
 
         # 20 password attempts per day
-        return TokenBucket.authorize(value, 20, 3600 * 24)
+        return TokenBucket.authorize(f"pw-{hashed}", 20, 3600 * 24)
 
     @staticmethod
     def authorize_telegram(telegram_id: int) -> bool:
-        value = "tg-%s" % telegram_id
-
         # 6 messages for a single chat per minute:
-        return TokenBucket.authorize(value, 6, 60)
+        return TokenBucket.authorize(f"tg-{telegram_id}", 6, 60)
 
     @staticmethod
     def authorize_signal(phone: str) -> bool:
         salted_encoded = (phone + settings.SECRET_KEY).encode()
-        value = "signal-%s" % hashlib.sha1(salted_encoded).hexdigest()
+        hashed = hashlib.sha1(salted_encoded).hexdigest()
 
         # 6 messages for a single recipient per minute:
-        return TokenBucket.authorize(value, 6, 60)
+        return TokenBucket.authorize(f"signal-{hashed}", 6, 60)
 
     @staticmethod
     def authorize_signal_verification(user: User) -> bool:
@@ -1220,9 +1336,10 @@ class TokenBucket(models.Model):
     @staticmethod
     def authorize_pushover(user_key: str) -> bool:
         salted_encoded = (user_key + settings.SECRET_KEY).encode()
-        value = "po-%s" % hashlib.sha1(salted_encoded).hexdigest()
+        hashed = hashlib.sha1(salted_encoded).hexdigest()
+
         # 6 messages for a single user key per minute:
-        return TokenBucket.authorize(value, 6, 60)
+        return TokenBucket.authorize(f"po-{hashed}", 6, 60)
 
     @staticmethod
     def authorize_sudo_code(user: User) -> bool:
@@ -1247,3 +1364,22 @@ class TokenBucket(models.Model):
         # During that period, allow the code to only be used once,
         # so an eavesdropping attacker cannot reuse a code.
         return TokenBucket.authorize(value, 1, 90)
+
+    @staticmethod
+    def s3_is_healthy() -> bool:
+        """Return True if fewer than 3 GetObject errors in the last minute."""
+        try:
+            obj = TokenBucket.objects.get(value="s3_get_object_error")
+        except TokenBucket.DoesNotExist:
+            return True
+
+        duration_secs = (now() - obj.updated).total_seconds()
+        # How many tokens we would have after top-up:
+        tokens = min(1.0, obj.tokens + duration_secs / 60)
+        return tokens >= 1.0 / 3
+
+    @staticmethod
+    def record_s3_get_object_error() -> None:
+        # Use force=True, we are recording the S3 error after the error already
+        # happened, and want to record it even if the tokens field would go negative.
+        TokenBucket.authorize("s3_get_object_error", 3, 60, force=True)

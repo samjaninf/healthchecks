@@ -4,6 +4,7 @@ from django.urls import include, path
 
 from hc.front import views
 
+# /checks/<code>/
 check_urls = [
     path("name/", views.update_name, name="hc-update-name"),
     path("details/", views.details, name="hc-details"),
@@ -14,6 +15,7 @@ check_urls = [
     path("remove/", views.remove_check, name="hc-remove-check"),
     path("clear_events/", views.clear_events, name="hc-clear-events"),
     path("log/", views.log, name="hc-log"),
+    path("log_events/", views.log_events, name="hc-log-events"),
     path("status/", views.status_single, name="hc-status-single"),
     path("last_ping/", views.ping_details, name="hc-last-ping"),
     path("transfer/", views.transfer, name="hc-transfer"),
@@ -27,10 +29,11 @@ check_urls = [
     path("pings/<int:n>/body/", views.ping_body, name="hc-ping-body"),
 ]
 
+# /integrations/
 channel_urls = [
     path("add_pushbullet/", views.add_pushbullet_complete),
     path("add_discord/", views.add_discord_complete),
-    path("add_linenotify/", views.add_linenotify_complete),
+    path("add_github/", views.add_github_select),
     path("add_pagerduty/", views.add_pd_complete, name="hc-add-pd-complete"),
     path("add_pushover/", views.pushover_help, name="hc-pushover-help"),
     path("telegram/", views.telegram_help, name="hc-telegram-help"),
@@ -57,13 +60,16 @@ channel_urls = [
     ),
 ]
 
+# /projects/<code>/
 project_urls = [
     path("add_apprise/", views.add_apprise, name="hc-add-apprise"),
     path("add_call/", views.add_call, name="hc-add-call"),
     path("add_discord/", views.add_discord, name="hc-add-discord"),
     path("add_email/", views.add_email, name="hc-add-email"),
+    path("add_github/", views.add_github, name="hc-add-github"),
+    path("add_github/save/", views.add_github_save, name="hc-add-github-save"),
     path("add_gotify/", views.add_gotify, name="hc-add-gotify"),
-    path("add_linenotify/", views.add_linenotify, name="hc-add-linenotify"),
+    path("add_group/", views.add_group, name="hc-add-group"),
     path("add_matrix/", views.add_matrix, name="hc-add-matrix"),
     path("add_mattermost/", views.add_mattermost, name="hc-add-mattermost"),
     path("add_msteams/", views.add_msteams, name="hc-add-msteams"),
@@ -87,7 +93,7 @@ project_urls = [
     path("add_whatsapp/", views.add_whatsapp, name="hc-add-whatsapp"),
     path("add_zulip/", views.add_zulip, name="hc-add-zulip"),
     path("badges/", views.badges, name="hc-badges"),
-    path("checks/", views.my_checks, name="hc-checks"),
+    path("checks/", views.checks, name="hc-checks"),
     path("checks/add/", views.add_check, name="hc-add-check"),
     path(
         "checks/metrics/<slug:key>",
@@ -102,10 +108,12 @@ project_urls = [
     path("integrations/", views.channels, name="hc-channels"),
 ]
 
+# /
 urlpatterns = [
     path("", views.index, name="hc-index"),
     path("tv/", views.dashboard, name="hc-dashboard"),
     path("checks/cron_preview/", views.cron_preview),
+    path("checks/oncalendar_preview/", views.oncalendar_preview),
     path("checks/validate_schedule/", views.validate_schedule),
     path("checks/<uuid:code>/", include(check_urls)),
     path("cloaked/<sha1:unique_key>/", views.uncloak, name="hc-uncloak"),

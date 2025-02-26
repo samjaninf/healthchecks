@@ -19,12 +19,16 @@ class StatusTestCase(BaseTestCase):
         self.assertEqual(r.status_code, 200)
         doc = r.json()
 
-        self.assertEqual(doc["tags"]["foo"], "up")
+        self.assertEqual(doc["tags"]["foo"], ["up", "1 up"])
 
         detail = doc["details"][0]
         self.assertEqual(detail["code"], str(self.check.code))
         self.assertEqual(detail["status"], "new")
         self.assertIn("Never", detail["last_ping"])
+
+    def test_it_returns_403_for_anon_requests(self) -> None:
+        r = self.client.get(self.url)
+        self.assertEqual(r.status_code, 403)
 
     def test_it_allows_cross_team_access(self) -> None:
         self.client.login(username="bob@example.org", password="password")

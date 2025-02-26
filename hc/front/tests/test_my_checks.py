@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta as td
 
+from django.test.utils import override_settings
 from django.utils.timezone import now
 
 from hc.api.models import Check
@@ -21,6 +22,7 @@ class MyChecksTestCase(BaseTestCase):
         for email in ("alice@example.org", "bob@example.org"):
             self.client.login(username=email, password="password")
             r = self.client.get(self.url)
+            self.assertContains(r, "favicon.svg")
             self.assertContains(r, "Alice Was Here", status_code=200)
             self.assertContains(r, str(self.check.code), status_code=200)
             # The pause button:
@@ -63,6 +65,7 @@ class MyChecksTestCase(BaseTestCase):
         r = self.client.get(self.url)
         self.assertContains(r, "ic-up")
 
+    @override_settings(SITE_NAME="Mychecks")
     def test_it_shows_red_check(self) -> None:
         self.check.last_ping = now() - td(days=3)
         self.check.status = "up"
@@ -71,6 +74,9 @@ class MyChecksTestCase(BaseTestCase):
         self.client.login(username="alice@example.org", password="password")
         r = self.client.get(self.url)
         self.assertContains(r, "ic-down")
+
+        self.assertContains(r, "favicon_down.svg")
+        self.assertContains(r, "1 down – Mychecks")
 
     def test_it_shows_amber_check(self) -> None:
         self.check.last_ping = now() - td(days=1, minutes=30)
@@ -117,7 +123,9 @@ class MyChecksTestCase(BaseTestCase):
 
         self.client.login(username="alice@example.org", password="password")
         r = self.client.get(self.url)
-        self.assertContains(r, """<div class="btn btn-xs down ">foo</div>""")
+        self.assertContains(
+            r, """<div data-tooltip="1 of 1 down" class="btn btn-xs down ">foo</div>"""
+        )
 
     def test_it_shows_grace_badge(self) -> None:
         self.check.last_ping = now() - td(days=1, minutes=10)
@@ -127,7 +135,9 @@ class MyChecksTestCase(BaseTestCase):
 
         self.client.login(username="alice@example.org", password="password")
         r = self.client.get(self.url)
-        self.assertContains(r, """<div class="btn btn-xs grace ">foo</div>""")
+        self.assertContains(
+            r, """<div data-tooltip="1 up" class="btn btn-xs grace ">foo</div>"""
+        )
 
     def test_it_shows_grace_started_badge(self) -> None:
         self.check.last_start = now()
@@ -138,7 +148,9 @@ class MyChecksTestCase(BaseTestCase):
 
         self.client.login(username="alice@example.org", password="password")
         r = self.client.get(self.url)
-        self.assertContains(r, """<div class="btn btn-xs grace ">foo</div>""")
+        self.assertContains(
+            r, """<div data-tooltip="1 up" class="btn btn-xs grace ">foo</div>"""
+        )
 
     def test_it_hides_actions_from_readonly_users(self) -> None:
         self.bobs_membership.role = "r"

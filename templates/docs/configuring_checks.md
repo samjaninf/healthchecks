@@ -30,9 +30,9 @@ case of failures, and where to look for additional information.
 
 ## Simple Schedules
 
-SITE_NAME supports two types of schedules: **Simple** and **Cron**. Use Simple
-schedules for monitoring processes that you expect to run at relatively regular
-intervals: once an hour, once a day, once a week, etc.
+SITE_NAME supports three types of schedules: **Simple**, **Cron**, and **OnCalendar**.
+Use Simple schedules for monitoring processes that you expect to run at relatively
+regular intervals: once an hour, once a day, once a week, etc.
 
 ![Editing the period and grace time](IMG_URL/edit_simple_schedule.png)
 
@@ -45,15 +45,19 @@ execution times.
 
 Note: if you use the "start" signal to [measure job run times](../measuring_script_run_time/),
 then Grace Time also specifies the maximum allowed time gap between "start" and
-"success" signals. Whenever SITE_NAME receives a "start" signal, it expects a subsequent 
-"success" signal within Grace Time. If the success signal does not arrive within the 
+"success" signals. Whenever SITE_NAME receives a "start" signal, it expects a subsequent
+"success" signal within Grace Time. If the success signal does not arrive within the
 configured Grace Time, SITE_NAME will mark the check as failed and send out alerts.
 
 ## Cron Schedules
 
-Use "cron" for monitoring processes with more complex schedules. This monitoring mode
-ensures that jobs run **at the correct time** and not just at the correct time
-intervals.
+Use "Cron" for monitoring cron jobs and other processes with more complex schedules.
+This monitoring mode ensures that jobs run **at the correct time** and not just at
+the correct time intervals.
+
+See [Cron syntax cheatsheet](../cron/) for cron expression syntax examples.
+See [crontab(5) man page](https://www.man7.org/linux/man-pages/man5/crontab.5.html)
+for complete cron syntax reference.
 
 ![Editing cron schedule](IMG_URL/edit_cron_schedule.png)
 
@@ -66,6 +70,18 @@ timezone here.
 * **Grace Time**, same as for simple schedules, is how long to wait before sending an
 alert for a late check.
 
+## OnCalendar Schedules
+
+Use "OnCalendar" schedules to monitor systemd timers that use `OnCalendar=` schedules.
+Same as with systemd timers, you can specify more than one `OnCalendar` expression
+(separated with newlines, one schedule per line), and SITE_NAME will expect a ping
+whenever any schedule matches.
+
+See [systemd.time(7) man page](https://www.man7.org/linux/man-pages/man7/systemd.time.7.html#CALENDAR_EVENTS)
+for complete OnCalendar syntax reference.
+
+![Editing cron schedule](IMG_URL/edit_oncalendar_schedule.png)
+
 ## Filtering Rules
 
 In the "Filtering Rules" dialog, you can control several advanced aspects of
@@ -77,11 +93,16 @@ how SITE_NAME handles incoming pings for a particular check.
 requests to use HTTP POST. Use the "Only POST" option if you run into issues of
 preview bots hitting the ping URLs when you send them in email or post them in chat.
 * **Filter by keywords in the Subject line**. When pinging [via email](../email/),
-look for specific keywords in the subject line. If the subject line contains any of
-the keywords listed in **Start Keywords**, **Success Keywords**, or
-**Failure Keywords**, SITE_NAME will assume it to be a start, a success, or a failure
-signal, respectively. Useful if, for example, your backup  software sends an email 
-after each backup run with a different subject line depending on success or failure.
+you can instruct SITE_NAME to look for specific keywords in the subject line. If the
+subject line contains any of the keywords listed in **Start Keywords**,
+**Success Keywords**, or **Failure Keywords**, SITE_NAME will classify the email as
+a start, a success, or a failure signal, respectively. Keyword matching is case-sensitive.
+SITE_NAME will first checks for the presence of **Failure** keywords, then **Success**
+keywords, and then **Start** keywords. If filtering is enabled but no keywords
+match, SITE_NAME will **ignore** the email message. The email will show in the event log
+with an "Ignored" badge.<br>The keyword filtering feature is useful if, for example,
+your backup  software sends an email after each backup run, but with a different subject
+line depending on success or failure.
 * **Filter by keywords in the message body**. Same as the previous option, but
 looks for the keywords in the email message body. SITE_NAME checks for keywords both in
 the plain text and the HTML parts of email messages.

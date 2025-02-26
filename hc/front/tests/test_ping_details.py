@@ -7,6 +7,7 @@ from django.test.utils import override_settings
 from django.utils.timezone import now
 
 from hc.api.models import Check, Ping
+from hc.lib.s3 import GetObjectError
 from hc.test import BaseTestCase
 
 PLAINTEXT_EMAIL = b"""Content-Type: multipart/alternative; boundary=bbb
@@ -56,13 +57,6 @@ class PingDetailsTestCase(BaseTestCase):
         r = self.client.get(self.url)
         self.assertContains(r, "this is body", status_code=200)
 
-    def test_it_displays_body(self) -> None:
-        Ping.objects.create(owner=self.check, n=1, body="this is body")
-
-        self.client.login(username="alice@example.org", password="password")
-        r = self.client.get(self.url)
-        self.assertContains(r, "this is body", status_code=200)
-
     def test_it_displays_duration(self) -> None:
         expected_duration = td(minutes=5)
         end_time = now()
@@ -77,7 +71,7 @@ class PingDetailsTestCase(BaseTestCase):
         self.assertContains(r, "5 min 0 sec", status_code=200)
 
     def test_it_requires_logged_in_user(self) -> None:
-        Ping.objects.create(owner=self.check, n=1, body="this is body")
+        Ping.objects.create(owner=self.check, n=1)
 
         r = self.client.get(self.url)
         self.assertRedirects(r, "/accounts/login/?next=" + self.url)
@@ -131,7 +125,7 @@ class PingDetailsTestCase(BaseTestCase):
         self.assertContains(r, "bar-456", status_code=200)
 
     def test_it_allows_cross_team_access(self) -> None:
-        Ping.objects.create(owner=self.check, n=1, body="this is body")
+        Ping.objects.create(owner=self.check, n=1)
 
         self.client.login(username="bob@example.org", password="password")
         r = self.client.get(self.url)
@@ -171,18 +165,6 @@ class PingDetailsTestCase(BaseTestCase):
         self.assertContains(r, "aGVsbG8gd29ybGQ=")
         self.assertContains(r, "hello world")
 
-    def test_it_decodes_plaintext_email_body_str(self) -> None:
-        body = PLAINTEXT_EMAIL.decode()
-        Ping.objects.create(owner=self.check, n=1, scheme="email", body=body)
-
-        self.client.login(username="alice@example.org", password="password")
-        r = self.client.get(self.url)
-
-        fragment = """<div id="email-body-plain" class="tab-pane active">"""
-        self.assertContains(r, fragment, status_code=200)
-        self.assertContains(r, "aGVsbG8gd29ybGQ=")
-        self.assertContains(r, "hello world")
-
     def test_it_handles_bad_base64_in_email_body(self) -> None:
         Ping.objects.create(
             owner=self.check, n=1, scheme="email", body_raw=BAD_BASE64_EMAIL
@@ -214,7 +196,7 @@ class PingDetailsTestCase(BaseTestCase):
             owner=self.check,
             n=1,
             scheme="email",
-            body="Subject: =?UTF-8?B?aGVsbG8gd29ybGQ=?=",
+            body_raw=b"Subject: =?UTF-8?B?aGVsbG8gd29ybGQ=?=",
         )
 
         self.client.login(username="alice@example.org", password="password")
@@ -268,6 +250,16 @@ class PingDetailsTestCase(BaseTestCase):
         r = self.client.get(self.url)
         self.assertContains(r, "please check back later", status_code=200)
 
+    @override_settings(S3_BUCKET="test-bucket")
+    @patch("hc.api.models.get_object")
+    def test_it_handles_missing_object_email(self, get_object: Mock) -> None:
+        Ping.objects.create(owner=self.check, n=1, scheme="email", object_size=1000)
+        get_object.return_value = None
+
+        self.client.login(username="alice@example.org", password="password")
+        r = self.client.get(self.url)
+        self.assertContains(r, "please check back later", status_code=200)
+
     @override_settings(S3_BUCKET=None)
     def test_it_handles_missing_s3_credentials(self) -> None:
         Ping.objects.create(owner=self.check, n=1, object_size=1000)
@@ -282,3 +274,12 @@ class PingDetailsTestCase(BaseTestCase):
         self.client.login(username="alice@example.org", password="password")
         r = self.client.get(f"/checks/{self.check.code}/pings/1/")
         self.assertContains(r, "(ignored)", status_code=200)
+
+    @override_settings(S3_BUCKET="test-bucket")
+    def test_it_handles_s3_outage(self) -> None:
+        Ping.objects.create(owner=self.check, n=1, object_size=1000)
+
+        self.client.login(username="alice@example.org", password="password")
+        with patch("hc.api.models.get_object", Mock(side_effect=GetObjectError)):
+            r = self.client.get(self.url)
+        self.assertContains(r, "please check back later", status_code=200)

@@ -5,18 +5,18 @@ import re
 from datetime import datetime
 from datetime import timedelta as td
 from datetime import timezone
-from urllib.parse import quote, urlencode
+from typing import Any
 
 from django import forms
-from django.conf import settings
 from django.core.exceptions import ValidationError
 
 from hc.front.validators import (
-    CronExpressionValidator,
+    CronValidator,
+    OnCalendarValidator,
     TimezoneValidator,
     WebhookValidator,
 )
-from hc.lib import curl
+from hc.lib import matrix
 
 
 def _is_latin1(s: str) -> bool:
@@ -27,7 +27,17 @@ def _is_latin1(s: str) -> bool:
         return False
 
 
+def _choices(csv: str) -> list[tuple[str, str]]:
+    return [(v, v) for v in csv.split(",")]
+
+
 class LaxURLField(forms.URLField):
+    """Subclass of URLField which additionally accepts URLs without a tld.
+
+    For example, unlike URLField, it accepts "http://home_server"
+
+    """
+
     default_validators = [WebhookValidator()]
 
 
@@ -85,9 +95,9 @@ class NameTagsForm(forms.Form):
 
 
 class AddCheckForm(NameTagsForm):
-    kind = forms.ChoiceField(choices=(("simple", "simple"), ("cron", "cron")))
+    kind = forms.ChoiceField(choices=_choices("simple,cron,oncalendar"))
     timeout = forms.IntegerField(min_value=60, max_value=31536000)
-    schedule = forms.CharField(max_length=100, validators=[CronExpressionValidator()])
+    schedule = forms.CharField(required=False, max_length=100)
     tz = forms.CharField(max_length=36, validators=[TimezoneValidator()])
     grace = forms.IntegerField(min_value=60, max_value=31536000)
 
@@ -96,6 +106,22 @@ class AddCheckForm(NameTagsForm):
 
     def clean_grace(self) -> td:
         return td(seconds=self.cleaned_data["grace"])
+
+    def clean_schedule(self) -> str:
+        kind = self.cleaned_data.get("kind")
+        if kind == "cron":
+            cron_validator = CronValidator()
+            cron_validator(self.cleaned_data["schedule"])
+        elif kind == "oncalendar":
+            oncalendar_validator = OnCalendarValidator()
+            oncalendar_validator(self.cleaned_data["schedule"])
+        else:
+            # If kind is not cron or oncalendar, ignore the passed in value
+            # and use "* * * * *" instead.
+            return "* * * * *"
+
+        assert isinstance(self.cleaned_data["schedule"], str)
+        return self.cleaned_data["schedule"]
 
 
 class FilteringRulesForm(forms.Form):
@@ -120,9 +146,21 @@ class TimeoutForm(forms.Form):
 
 
 class CronForm(forms.Form):
-    schedule = forms.CharField(max_length=100, validators=[CronExpressionValidator()])
+    schedule = forms.CharField(max_length=100, validators=[CronValidator()])
     tz = forms.CharField(max_length=36, validators=[TimezoneValidator()])
-    grace = forms.IntegerField(min_value=1, max_value=43200)
+    grace = forms.IntegerField(min_value=60, max_value=31536000)
+
+    def clean_grace(self) -> td:
+        return td(seconds=self.cleaned_data["grace"])
+
+
+class OnCalendarForm(forms.Form):
+    schedule = forms.CharField(max_length=100, validators=[OnCalendarValidator()])
+    tz = forms.CharField(max_length=36, validators=[TimezoneValidator()])
+    grace = forms.IntegerField(min_value=60, max_value=31536000)
+
+    def clean_grace(self) -> td:
+        return td(seconds=self.cleaned_data["grace"])
 
 
 class AddOpsgenieForm(forms.Form):
@@ -165,25 +203,22 @@ class EmailForm(forms.Form):
 
 class AddUrlForm(forms.Form):
     error_css_class = "has-error"
-    value = LaxURLField(max_length=1000)
-
-
-METHODS = ("GET", "POST", "PUT")
+    value = LaxURLField(max_length=1000, assume_scheme="https")
 
 
 class WebhookForm(forms.Form):
     error_css_class = "has-error"
     name = forms.CharField(max_length=100, required=False)
 
-    method_down = forms.ChoiceField(initial="GET", choices=zip(METHODS, METHODS))
+    method_down = forms.ChoiceField(initial="GET", choices=_choices("GET,POST,PUT"))
     body_down = forms.CharField(max_length=1000, required=False)
     headers_down = HeadersField(required=False)
-    url_down = LaxURLField(max_length=1000, required=False)
+    url_down = LaxURLField(max_length=1000, required=False, assume_scheme="https")
 
-    method_up = forms.ChoiceField(initial="GET", choices=zip(METHODS, METHODS))
+    method_up = forms.ChoiceField(initial="GET", choices=_choices("GET,POST,PUT"))
     body_up = forms.CharField(max_length=1000, required=False)
     headers_up = HeadersField(required=False)
-    url_up = LaxURLField(max_length=1000, required=False)
+    url_up = LaxURLField(max_length=1000, required=False, assume_scheme="https")
 
     def clean(self) -> None:
         super().clean()
@@ -252,6 +287,52 @@ class PhoneUpDownForm(PhoneNumberForm):
         )
 
 
+class SignalRecipientForm(forms.Form):
+    error_css_class = "has-error"
+    label = forms.CharField(max_length=100, required=False)
+    recipient = forms.CharField()
+
+    def clean_recipient(self) -> str:
+        v = self.cleaned_data["recipient"]
+
+        stripped = v.encode("ascii", "ignore").decode("ascii")
+        assert isinstance(stripped, str)
+        stripped = stripped.replace(" ", "").replace("-", "")
+        if "." in stripped:
+            # Assume it is a username
+            if not re.match(r"^\w{3,48}\.\d{2,10}$", stripped):
+                raise forms.ValidationError("Invalid username format.")
+        else:
+            # Assume it is a phone number
+            if not re.match(r"^\+\d{5,15}$", stripped):
+                raise forms.ValidationError("Invalid phone number format.")
+
+        return stripped
+
+
+class SignalForm(SignalRecipientForm):
+    up = forms.BooleanField(required=False, initial=True)
+    down = forms.BooleanField(required=False, initial=True)
+
+    def clean(self) -> None:
+        super().clean()
+
+        down = self.cleaned_data.get("down")
+        up = self.cleaned_data.get("up")
+
+        if not down and not up:
+            self.add_error("down", "Please select at least one.")
+
+    def get_json(self) -> str:
+        return json.dumps(
+            {
+                "value": self.cleaned_data["recipient"],
+                "up": self.cleaned_data["up"],
+                "down": self.cleaned_data["down"],
+            }
+        )
+
+
 class ChannelNameForm(forms.Form):
     name = forms.CharField(max_length=100, required=False)
 
@@ -265,27 +346,10 @@ class AddMatrixForm(forms.Form):
         assert isinstance(v, str)
 
         # validate it by trying to join
-        assert settings.MATRIX_HOMESERVER
-        url = settings.MATRIX_HOMESERVER
-        url += "/_matrix/client/r0/join/%s?" % quote(v)
-        url += urlencode({"access_token": settings.MATRIX_ACCESS_TOKEN})
-        r = curl.post(url, {})
-        if r.status_code == 429:
-            raise forms.ValidationError(
-                "Matrix server returned status code 429 (Too Many Requests), "
-                "please try again later."
-            )
-        if r.status_code == 502:
-            raise forms.ValidationError(
-                "Matrix server returned status code 502 (Bad Gateway), "
-                "please try again later."
-            )
-
-        doc = r.json()
-        if "error" in doc:
-            raise forms.ValidationError("Response from Matrix: %s" % doc["error"])
-
-        self.cleaned_data["room_id"] = doc["room_id"]
+        try:
+            self.cleaned_data["room_id"] = matrix.join(v)
+        except matrix.JoinError as e:
+            raise forms.ValidationError(e.message)
 
         return v
 
@@ -307,7 +371,7 @@ class AddZulipForm(forms.Form):
     error_css_class = "has-error"
     bot_email = forms.EmailField(max_length=100)
     api_key = forms.CharField(max_length=50)
-    site = LaxURLField(max_length=100)
+    site = LaxURLField(max_length=100, assume_scheme="https")
     mtype = forms.ChoiceField(choices=ZULIP_TARGETS)
     to = forms.CharField(max_length=100)
     topic = forms.CharField(max_length=100, required=False)
@@ -317,7 +381,7 @@ class AddZulipForm(forms.Form):
 
 
 class AddTrelloForm(forms.Form):
-    token = forms.RegexField(regex=r"^[0-9a-fA-F]{64,256}$")
+    token = forms.CharField(max_length=1000)
     board_name = forms.CharField(max_length=100)
     list_name = forms.CharField(max_length=100)
     list_id = forms.RegexField(regex=r"^[0-9a-fA-F]{16,32}$")
@@ -329,16 +393,34 @@ class AddTrelloForm(forms.Form):
 class AddGotifyForm(forms.Form):
     error_css_class = "has-error"
     token = forms.CharField(max_length=50)
-    url = LaxURLField(max_length=1000)
+    url = LaxURLField(max_length=1000, assume_scheme="https")
 
     def get_value(self) -> str:
         return json.dumps(dict(self.cleaned_data), sort_keys=True)
 
 
+class GroupForm(forms.Form):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        project = kwargs.pop("project")
+        super().__init__(*args, **kwargs)
+
+        assert isinstance(self.fields["channels"], forms.MultipleChoiceField)
+        self.fields["channels"].choices = (
+            (c.code, c) for c in project.channel_set.exclude(kind="group")
+        )
+
+    error_css_class = "has-error"
+    label = forms.CharField(max_length=100, required=False)
+    channels = forms.MultipleChoiceField()
+
+    def get_value(self) -> str:
+        return ",".join(self.cleaned_data["channels"])
+
+
 class NtfyForm(forms.Form):
     error_css_class = "has-error"
-    topic = forms.CharField(max_length=50)
-    url = LaxURLField(max_length=1000)
+    topic = forms.CharField(max_length=64)
+    url = LaxURLField(max_length=1000, assume_scheme="https")
     token = forms.CharField(max_length=100, required=False)
     priority = forms.IntegerField(initial=3, min_value=0, max_value=5)
     priority_up = forms.IntegerField(initial=3, min_value=0, max_value=5)
@@ -351,16 +433,31 @@ class SearchForm(forms.Form):
     q = forms.RegexField(regex=r"^[0-9a-zA-Z\s]{3,100}$")
 
 
-class SeekForm(forms.Form):
+class LogFiltersForm(forms.Form):
     # min_value is 2010-01-01, max_value is 2030-01-01
-    start = forms.IntegerField(min_value=1262296800, max_value=1893448800)
-    end = forms.IntegerField(min_value=1262296800, max_value=1893448800)
+    u = forms.FloatField(min_value=1262296800, max_value=1893448800, required=False)
+    end = forms.FloatField(min_value=1262296800, max_value=1893448800, required=False)
+    success = forms.BooleanField(required=False)
+    fail = forms.BooleanField(required=False)
+    start = forms.BooleanField(required=False)
+    log = forms.BooleanField(required=False)
+    ign = forms.BooleanField(required=False)
+    notification = forms.BooleanField(required=False)
+    flip = forms.BooleanField(required=False)
 
-    def clean_start(self) -> datetime:
-        return datetime.fromtimestamp(self.cleaned_data["start"], tz=timezone.utc)
+    def clean_u(self) -> datetime | None:
+        if self.cleaned_data["u"]:
+            return datetime.fromtimestamp(self.cleaned_data["u"], tz=timezone.utc)
+        return None
 
-    def clean_end(self) -> datetime:
-        return datetime.fromtimestamp(self.cleaned_data["end"], tz=timezone.utc)
+    def clean_end(self) -> datetime | None:
+        if self.cleaned_data["end"]:
+            return datetime.fromtimestamp(self.cleaned_data["end"], tz=timezone.utc)
+        return None
+
+    def kinds(self) -> tuple[str, ...]:
+        kind_keys = ("success", "fail", "start", "log", "ign", "notification", "flip")
+        return tuple(key for key in kind_keys if self.cleaned_data[key])
 
 
 class TransferForm(forms.Form):
@@ -369,3 +466,26 @@ class TransferForm(forms.Form):
 
 class AddTelegramForm(forms.Form):
     project = forms.UUIDField()
+
+
+class BadgeSettingsForm(forms.Form):
+    target = forms.ChoiceField(choices=_choices("all,tag,check"))
+    tag = forms.CharField(max_length=100, required=False)
+    check = forms.UUIDField(required=False)
+    fmt = forms.ChoiceField(choices=_choices("svg,json,shields"))
+    states = forms.ChoiceField(choices=_choices("2,3"))
+
+
+class AddGitHubForm(forms.Form):
+    repo_name = forms.CharField(max_length=500)
+    labels = forms.CharField(max_length=500, required=False)
+
+    def get_labels(self) -> list[str]:
+        result = []
+
+        for part in self.cleaned_data["labels"].split(","):
+            part = part.strip()
+            if part != "":
+                result.append(part)
+
+        return result

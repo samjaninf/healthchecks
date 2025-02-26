@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from hc.api.models import Check, Ping
+from unittest.mock import Mock, patch
+
+from django.utils.timezone import now
+
+from hc.api.models import Check, Ping, TokenBucket
+from hc.lib.s3 import GetObjectError
 from hc.test import BaseTestCase
 
 
@@ -36,7 +41,7 @@ class PingBodyTestCase(BaseTestCase):
         self.assertEqual(r.status_code, 404)
 
     def test_it_allows_cross_team_access(self) -> None:
-        Ping.objects.create(owner=self.check, body="this is body")
+        Ping.objects.create(owner=self.check)
 
         self.client.login(username="bob@example.org", password="password")
         r = self.client.get(self.url)
@@ -50,3 +55,25 @@ class PingBodyTestCase(BaseTestCase):
         r = self.client.get(self.url)
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.content, b"Hello\x01\x99World")
+
+    def test_it_handles_unhealthy_s3(self) -> None:
+        self.ping.object_size = 123
+        self.ping.save()
+
+        obj = TokenBucket(value="s3_get_object_error")
+        obj.tokens = 0.0
+        obj.updated = now()
+        obj.save()
+
+        self.client.login(username="alice@example.org", password="password")
+        r = self.client.get(self.url)
+        self.assertEqual(r.status_code, 503)
+
+    def test_it_handles_s3_error(self) -> None:
+        self.ping.object_size = 123
+        self.ping.save()
+
+        self.client.login(username="alice@example.org", password="password")
+        with patch("hc.api.models.get_object", Mock(side_effect=GetObjectError)):
+            r = self.client.get(self.url)
+        self.assertEqual(r.status_code, 503)

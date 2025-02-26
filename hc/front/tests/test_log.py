@@ -13,7 +13,9 @@ from hc.test import BaseTestCase
 class LogTestCase(BaseTestCase):
     def setUp(self) -> None:
         super().setUp()
-        self.check = Check.objects.create(project=self.project)
+        self.check = Check(project=self.project)
+        self.check.created = "2000-01-01T00:00:00+00:00"
+        self.check.save()
 
         self.ping = Ping.objects.create(owner=self.check, n=1)
         self.ping.body_raw = b"hello world"
@@ -23,20 +25,9 @@ class LogTestCase(BaseTestCase):
         self.ping.created = "2000-01-01T00:00:00+00:00"
         self.ping.save()
 
-        self.url = "/checks/%s/log/" % self.check.code
+        self.url = f"/checks/{self.check.code}/log/"
 
     def test_it_works(self) -> None:
-        self.client.login(username="alice@example.org", password="password")
-        r = self.client.get(self.url)
-        self.assertContains(r, "Browser's time zone", status_code=200)
-        self.assertContains(r, "Found 1 ping event.")
-        self.assertContains(r, "hello world")
-
-    def test_it_displays_body(self) -> None:
-        self.ping.body = "hello world"
-        self.ping.body_raw = None
-        self.ping.save()
-
         self.client.login(username="alice@example.org", password="password")
         r = self.client.get(self.url)
         self.assertContains(r, "Browser's time zone", status_code=200)
@@ -88,49 +79,6 @@ class LogTestCase(BaseTestCase):
         self.client.login(username="charlie@example.org", password="password")
         r = self.client.get(self.url)
         self.assertEqual(r.status_code, 404)
-
-    def test_it_shows_email_notification(self) -> None:
-        ch = Channel(kind="email", project=self.project)
-        ch.value = json.dumps({"value": "alice@example.org", "up": True, "down": True})
-        ch.save()
-
-        Notification(owner=self.check, channel=ch, check_status="down").save()
-
-        self.client.login(username="alice@example.org", password="password")
-        r = self.client.get(self.url)
-        self.assertContains(r, "Sent email to alice@example.org", status_code=200)
-
-    def test_it_shows_pushover_notification(self) -> None:
-        ch = Channel.objects.create(kind="po", project=self.project)
-
-        Notification(owner=self.check, channel=ch, check_status="down").save()
-
-        self.client.login(username="alice@example.org", password="password")
-        r = self.client.get(self.url)
-        self.assertContains(r, "Sent a Pushover notification", status_code=200)
-
-    def test_it_shows_webhook_notification(self) -> None:
-        ch = Channel(kind="webhook", project=self.project)
-        ch.value = json.dumps(
-            {
-                "method_down": "GET",
-                "url_down": "foo/$NAME",
-                "body_down": "",
-                "headers_down": {},
-            }
-        )
-        ch.save()
-
-        Notification(owner=self.check, channel=ch, check_status="down").save()
-
-        self.client.login(username="alice@example.org", password="password")
-        r = self.client.get(self.url)
-        self.assertContains(r, "Called webhook foo/$NAME", status_code=200)
-
-    def test_it_allows_cross_team_access(self) -> None:
-        self.client.login(username="bob@example.org", password="password")
-        r = self.client.get(self.url)
-        self.assertEqual(r.status_code, 200)
 
     def test_it_shows_ignored_nonzero_exitstatus(self) -> None:
         self.ping.kind = "ign"

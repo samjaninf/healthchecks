@@ -45,8 +45,9 @@ class GetCheckTestCase(BaseTestCase):
         self.assertEqual(r["Access-Control-Allow-Origin"], "*")
 
         doc = r.json()
-        self.assertEqual(len(doc), 25)
+        self.assertEqual(len(doc), 27)
 
+        self.assertEqual(doc["uuid"], str(self.a1.code))
         self.assertEqual(doc["slug"], "alice-1-custom-slug")
         self.assertEqual(doc["timeout"], 3600)
         self.assertEqual(doc["grace"], 900)
@@ -66,6 +67,12 @@ class GetCheckTestCase(BaseTestCase):
         self.assertEqual(doc["failure_kw"], "ERROR")
         self.assertTrue(doc["filter_subject"])
         self.assertFalse(doc["filter_body"])
+        self.assertEqual(
+            doc["badge_url"], f"http://localhost:8000/b/2/{self.a1.badge_key}.svg"
+        )
+        self.assertEqual(
+            doc["update_url"], f"http://localhost:8000/api/v1/checks/{self.a1.code}"
+        )
 
     def test_it_handles_invalid_uuid(self) -> None:
         r = self.get("not-an-uuid")
@@ -82,7 +89,7 @@ class GetCheckTestCase(BaseTestCase):
         self.assertEqual(r["Access-Control-Allow-Origin"], "*")
 
         doc = r.json()
-        self.assertEqual(len(doc), 25)
+        self.assertEqual(len(doc), 27)
 
         self.assertEqual(doc["timeout"], 3600)
         self.assertEqual(doc["grace"], 900)
@@ -105,7 +112,8 @@ class GetCheckTestCase(BaseTestCase):
         self.assertEqual(r.status_code, 200)
 
         # When using readonly keys, the ping URLs should not be exposed:
-        for key in ("ping_url", "update_url", "pause_url", "resume_url"):
+        self.assertNotContains(r, str(self.a1.code))
+        for key in ("uuid", "ping_url", "update_url", "pause_url", "resume_url"):
             self.assertNotContains(r, key)
 
     def test_v1_reports_status_started(self) -> None:
