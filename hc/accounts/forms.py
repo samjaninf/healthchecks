@@ -61,15 +61,18 @@ class EmailLoginForm(forms.Form):
     # to avoid some of the dumber bots
     identity = LowercaseEmailField()
 
-    def __init__(self, request: HttpRequest):
+    def __init__(self, request: HttpRequest | None = None):
         self.request = request
         super(EmailLoginForm, self).__init__(request.POST if request else None)
 
     def clean_identity(self) -> str:
         v = self.cleaned_data["identity"]
+
         assert isinstance(v, str)
         if not TokenBucket.authorize_login_email(v):
             raise forms.ValidationError("Too many attempts, please try later.")
+
+        assert self.request
         if not TokenBucket.authorize_auth_ip(self.request):
             raise forms.ValidationError("Too many attempts, please try later.")
 

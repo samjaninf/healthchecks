@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ParamSpec, TypeVar
 
 from django.contrib.auth.models import User
 from django.core.signing import TimestampSigner
@@ -17,6 +17,9 @@ else:
     from django.http import HttpResponse as TestHttpResponse
 
 __all__ = ["BaseTestCase", "TestHttpResponse"]
+
+P = ParamSpec("P")
+T = TypeVar("T")
 
 
 class BaseTestCase(TestCase):
@@ -68,7 +71,7 @@ class BaseTestCase(TestCase):
         self.charlies_profile = Profile(user=self.charlie)
         self.charlies_profile.save()
 
-        self.channels_url = "/projects/%s/integrations/" % self.project.code
+        self.channels_url = f"/projects/{self.project.code}/integrations/"
 
     def set_sudo_flag(self) -> None:
         session = self.client.session

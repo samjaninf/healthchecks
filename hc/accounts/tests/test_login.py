@@ -23,7 +23,14 @@ class LoginTestCase(BaseTestCase):
 
     def test_it_shows_form(self) -> None:
         r = self.client.get("/accounts/login/")
-        self.assertContains(r, "Email Me a Link")
+        self.assertContains(r, "magic-link-form")
+        # It should not show validation errors yet
+        self.assertNotContains(r, "This field is required")
+
+    @override_settings(EMAIL_HOST=None)
+    def test_it_handles_no_smtp(self) -> None:
+        r = self.client.get("/accounts/login/")
+        self.assertNotContains(r, "magic-link-form")
 
     def test_it_redirects_authenticated_get(self) -> None:
         self.client.login(username="alice@example.org", password="password")
@@ -162,13 +169,10 @@ class LoginTestCase(BaseTestCase):
 
     def test_it_handles_password_login_with_redirect(self) -> None:
         check = Check.objects.create(project=self.project)
-
         form = {"action": "login", "email": "alice@example.org", "password": "password"}
-
-        samples = [self.channels_url, "/checks/%s/details/" % check.code]
-
+        samples = [self.channels_url, f"/checks/{check.code}/details/"]
         for s in samples:
-            r = self.client.post("/accounts/login/?next=%s" % s, form)
+            r = self.client.post(f"/accounts/login/?next={s}", form)
             self.assertRedirects(r, s)
 
     def test_it_handles_bad_next_parameter(self) -> None:

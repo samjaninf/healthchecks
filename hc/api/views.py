@@ -5,6 +5,7 @@ import time
 from collections.abc import Iterable
 from datetime import datetime
 from datetime import timedelta as td
+from datetime import timezone
 from email import message_from_bytes
 from typing import Any, Literal
 from uuid import UUID
@@ -12,7 +13,7 @@ from uuid import UUID
 from cronsim import CronSim, CronSimError
 from django.conf import settings
 from django.core.signing import BadSignature
-from django.db import connection
+from django.db import connection, transaction
 from django.db.models import Prefetch
 from django.http import (
     Http404,
@@ -29,6 +30,7 @@ from django.utils.timezone import now
 from django.views.decorators.cache import never_cache
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
+from oncalendar import OnCalendar, OnCalendarError
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
@@ -39,12 +41,20 @@ from hc.api.models import MAX_DURATION, Channel, Check, Flip, Notification, Ping
 from hc.lib.badges import check_signature, get_badge_svg, get_badge_url
 from hc.lib.signing import unsign_bounce_id
 from hc.lib.string import is_valid_uuid_string
-from hc.lib.tz import all_timezones
+from hc.lib.tz import all_timezones, legacy_timezones
 
 
 class BadChannelException(Exception):
     def __init__(self, message: str):
         self.message = message
+
+
+def guess_kind(schedule: str) -> str:
+    # If it is a single line with 5 components, it is probably a cron expression:
+    if "\n" not in schedule.strip() and len(schedule.split()) == 5:
+        return "cron"
+
+    return "oncalendar"
 
 
 class Spec(BaseModel):
@@ -58,7 +68,7 @@ class Spec(BaseModel):
     methods: Literal["", "POST"] | None = None
     name: str | None = Field(None, max_length=100)
     schedule: str | None = Field(None, max_length=100)
-    slug: str | None = Field(None, pattern="^[a-z0-9-_]*$")
+    slug: str | None = Field(None, max_length=100, pattern="^[a-z0-9-_]*$")
     start_kw: str | None = Field(None, max_length=200)
     subject: str | None = Field(None, max_length=200)
     subject_fail: str | None = Field(None, max_length=200)
@@ -76,7 +86,7 @@ class Spec(BaseModel):
         # strict validation, so this will cause type validation to fail.
         for k, v in data.items():
             if v is None:
-                data[k] = float()
+                data[k] = 0.0
         return data
 
     @field_validator("timeout", "grace", mode="before")
@@ -89,6 +99,11 @@ class Spec(BaseModel):
     @field_validator("tz")
     @classmethod
     def check_tz(cls, v: str) -> str:
+        if v in legacy_timezones:
+            # Replace legacy timezone with the current canonical time zone
+            # (for example, Europe/Kiev -> Europe/Kyiv)
+            v = legacy_timezones[v]
+
         if v not in all_timezones:
             raise PydanticCustomError("tz_syntax", "not a valid timezone")
         return v
@@ -96,19 +111,31 @@ class Spec(BaseModel):
     @field_validator("schedule")
     @classmethod
     def check_schedule(cls, v: str) -> str:
-        # Does it have 5 components?
-        if len(v.split()) != 5:
-            raise PydanticCustomError("cron_syntax", "not a valid cron expression")
-
-        try:
-            # Does cronsim accept the schedule?
-            it = CronSim(v, datetime(2000, 1, 1))
-            # Can it calculate the next datetime?
-            next(it)
-        except (CronSimError, StopIteration):
-            raise PydanticCustomError("cron_syntax", "not a valid cron expression")
+        if guess_kind(v) == "cron":
+            try:
+                # Test if cronsim accepts it and can calculate the next datetime
+                it = CronSim(v, datetime(2000, 1, 1))
+                next(it)
+            except (CronSimError, StopIteration):
+                raise PydanticCustomError("cron_syntax", "not a valid cron expression")
+        else:
+            try:
+                # Test if oncalendar accepts it, and can calculate the next datetime
+                oncalendar_it = OnCalendar(v, datetime(2000, 1, 1, tzinfo=timezone.utc))
+                next(oncalendar_it)
+            except (OnCalendarError, StopIteration):
+                raise PydanticCustomError("cron_syntax", "not a valid expression")
 
         return v
+
+    def kind(self) -> str | None:
+        if self.schedule:
+            return guess_kind(self.schedule)
+
+        if self.timeout:
+            return "simple"
+
+        return None
 
 
 CUSTOM_ERRORS = {
@@ -122,7 +149,7 @@ CUSTOM_ERRORS = {
     "bool_type": "%s is not a boolean",
     "literal_error": "%s has unexpected value",
     "list_type": "%s is not an array",
-    "cron_syntax": "%s is not a valid cron expression",
+    "cron_syntax": "%s is not a valid cron or OnCalendar expression",
     "tz_syntax": "%s is not a valid timezone",
     "time_delta_type": "%s is not a number",
 }
@@ -290,15 +317,17 @@ def _update(check: Check, spec: Spec, v: int) -> None:
             check.slug = slugify(spec.name)
         need_save = True
 
-    if spec.timeout is not None and spec.schedule is None:
+    kind = spec.kind()
+    if kind == "simple":
         if check.kind != "simple" or check.timeout != spec.timeout:
             check.kind = "simple"
             check.timeout = spec.timeout
             need_save = True
 
-    if spec.schedule is not None:
-        if check.kind != "cron" or check.schedule != spec.schedule:
-            check.kind = "cron"
+    if kind in ("cron", "oncalendar"):
+        if check.kind != kind or check.schedule != spec.schedule:
+            check.kind = kind
+            assert spec.schedule is not None
             check.schedule = spec.schedule
             need_save = True
 
@@ -421,8 +450,7 @@ def get_check(request: ApiRequest, code: UUID) -> HttpResponse:
 @csrf_exempt
 @authorize_read
 def get_check_by_unique_key(request: ApiRequest, unique_key: str) -> HttpResponse:
-    checks = Check.objects.filter(project=request.project.id)
-    for check in checks:
+    for check in request.project.check_set.all():
         if check.unique_key == unique_key:
             return JsonResponse(check.to_dict(readonly=request.readonly, v=request.v))
     return HttpResponseNotFound()
@@ -430,6 +458,8 @@ def get_check_by_unique_key(request: ApiRequest, unique_key: str) -> HttpRespons
 
 @authorize
 def update_check(request: ApiRequest, code: UUID) -> HttpResponse:
+    # Don't acquire lock right away, first see if the check exists
+    # and matches the API key
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:
         return HttpResponseForbidden()
@@ -439,21 +469,34 @@ def update_check(request: ApiRequest, code: UUID) -> HttpResponse:
     except ValidationError as e:
         return JsonResponse({"error": format_first_error(e)}, status=400)
 
-    try:
-        _update(check, spec, request.v)
-    except BadChannelException as e:
-        return JsonResponse({"error": e.message}, status=400)
+    # Start a transaction, select for update, update.
+    # Use get_object_or_404 here again, in case another concurrent request
+    # has *just* deleted this check.
+    with transaction.atomic():
+        check = get_object_or_404(Check.objects.select_for_update(), code=code)
+        try:
+            _update(check, spec, request.v)
+        except BadChannelException as e:
+            return JsonResponse({"error": e.message}, status=400)
 
     return JsonResponse(check.to_dict(v=request.v))
 
 
 @authorize
 def delete_check(request: ApiRequest, code: UUID) -> HttpResponse:
+    # Don't acquire lock right away, first see if the check exists
+    # and matches the API key
     check = get_object_or_404(Check, code=code)
     if check.project_id != request.project.id:
         return HttpResponseForbidden()
 
-    check.lock_and_delete()
+    # Start a transaction, select for update, delete.
+    # Use get_object_or_404 here again, in case another concurrent request
+    # has *just* deleted this check.
+    with transaction.atomic():
+        check = get_object_or_404(Check.objects.select_for_update(), code=code)
+        check.delete()
+
     return JsonResponse(check.to_dict(v=request.v))
 
 
@@ -573,7 +616,11 @@ def ping_body(request: ApiRequest, code: UUID, n: int) -> HttpResponse:
         raise Http404()
 
     ping = get_object_or_404(Ping, owner=check, n=n)
-    body = ping.get_body_bytes()
+    try:
+        body = ping.get_body_bytes()
+    except Ping.GetBodyError:
+        return HttpResponse(status=503)
+
     if not body:
         raise Http404()
 
@@ -616,8 +663,7 @@ def flips_by_uuid(request: ApiRequest, code: UUID) -> HttpResponse:
 @csrf_exempt
 @authorize_read
 def flips_by_unique_key(request: ApiRequest, unique_key: str) -> HttpResponse:
-    checks = Check.objects.filter(project=request.project.id)
-    for check in checks:
+    for check in request.project.check_set.all():
         if check.unique_key == unique_key:
             return flips(request, check)
     return HttpResponseNotFound()
@@ -628,7 +674,7 @@ def flips_by_unique_key(request: ApiRequest, unique_key: str) -> HttpResponse:
 @authorize_read
 def badges(request: ApiRequest) -> JsonResponse:
     tags = set(["*"])
-    for check in Check.objects.filter(project=request.project):
+    for check in request.project.check_set.all():
         tags.update(check.tags_list())
 
     key = request.project.badge_key
@@ -644,6 +690,20 @@ def badges(request: ApiRequest) -> JsonResponse:
         }
 
     return JsonResponse({"badges": badges})
+
+
+SHIELDS_COLORS = {"up": "success", "late": "important", "down": "critical"}
+
+
+def _shields_response(label: str, status: str) -> JsonResponse:
+    return JsonResponse(
+        {
+            "schemaVersion": 1,
+            "label": label,
+            "message": status,
+            "color": SHIELDS_COLORS[status],
+        }
+    )
 
 
 @never_cache
@@ -662,11 +722,11 @@ def badge(
         return HttpResponseNotFound()
 
     q = Check.objects.filter(project__badge_key=badge_key)
-    if tag != "*":
+    if tag == "*":
+        label = settings.MASTER_BADGE_LABEL
+    else:
         q = q.filter(tags__contains=tag)
         label = tag
-    else:
-        label = settings.MASTER_BADGE_LABEL
 
     status, total, grace, down = "up", 0, 0, 0
     for check in q:
@@ -689,15 +749,7 @@ def badge(
                 status = "late"
 
     if fmt == "shields":
-        color = "success"
-        if status == "down":
-            color = "critical"
-        elif status == "late":
-            color = "important"
-
-        return JsonResponse(
-            {"schemaVersion": 1, "label": label, "message": status, "color": color}
-        )
+        return _shields_response(label, status)
 
     if fmt == "json":
         return JsonResponse(
@@ -705,6 +757,39 @@ def badge(
         )
 
     svg = get_badge_svg(label, status)
+    return HttpResponse(svg, content_type="image/svg+xml")
+
+
+@never_cache
+@cors("GET")
+def check_badge(
+    request: HttpRequest, states: int, badge_key: UUID, fmt: str
+) -> HttpResponse:
+    if fmt not in ("svg", "json", "shields"):
+        return HttpResponseNotFound()
+
+    check = get_object_or_404(Check, badge_key=badge_key)
+    check_status = check.get_status()
+    status = "up"
+    if check_status == "down":
+        status = "down"
+    elif check_status == "grace" and states == 3:
+        status = "late"
+
+    if fmt == "shields":
+        return _shields_response(check.name_then_code(), status)
+
+    if fmt == "json":
+        return JsonResponse(
+            {
+                "status": status,
+                "total": 1,
+                "grace": 1 if check_status == "grace" else 0,
+                "down": 1 if check_status == "down" else 0,
+            }
+        )
+
+    svg = get_badge_svg(check.name_then_code(), status)
     return HttpResponse(svg, content_type="image/svg+xml")
 
 

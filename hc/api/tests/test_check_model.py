@@ -6,7 +6,7 @@ from datetime import timezone
 from unittest.mock import Mock, patch
 
 from django.test.utils import override_settings
-from django.utils.timezone import make_aware, now
+from django.utils.timezone import now
 
 from hc.api.models import Channel, Check, Flip, Notification, Ping
 from hc.test import BaseTestCase
@@ -43,8 +43,7 @@ class CheckModelTestCase(BaseTestCase):
         self.assertEqual(check.get_status(), "paused")
 
     def test_status_works_with_cron_syntax(self) -> None:
-        dt = make_aware(datetime(2000, 1, 1), timezone=timezone.utc)
-
+        dt = datetime(2000, 1, 1, tzinfo=timezone.utc)
         # Expect ping every midnight, default grace is 1 hour
         check = Check()
         check.kind = "cron"
@@ -57,19 +56,50 @@ class CheckModelTestCase(BaseTestCase):
             mock_now.return_value = dt + td(hours=23, minutes=59)
             self.assertEqual(check.get_status(), "up")
 
-        with patch("hc.api.models.now") as mock_now:
             # 00:00am
             mock_now.return_value = dt + td(days=1)
             self.assertEqual(check.get_status(), "grace")
 
-        with patch("hc.api.models.now") as mock_now:
             # 1:30am
             mock_now.return_value = dt + td(days=1, minutes=60)
             self.assertEqual(check.get_status(), "down")
 
-    def test_status_works_with_timezone(self) -> None:
-        dt = make_aware(datetime(2000, 1, 1), timezone=timezone.utc)
+    def test_status_works_with_oncalendar_syntax(self) -> None:
+        dt = datetime(2000, 1, 1, tzinfo=timezone.utc)
+        # Expect ping every midnight, default grace is 1 hour
+        check = Check()
+        check.kind = "oncalendar"
+        check.schedule = "00:00"
+        check.status = "up"
+        check.last_ping = dt
 
+        with patch("hc.api.models.now") as mock_now:
+            # 23:59pm
+            mock_now.return_value = dt + td(hours=23, minutes=59)
+            self.assertEqual(check.get_status(), "up")
+
+            # 00:00am
+            mock_now.return_value = dt + td(days=1)
+            self.assertEqual(check.get_status(), "grace")
+
+            # 1:30am
+            mock_now.return_value = dt + td(days=1, minutes=60)
+            self.assertEqual(check.get_status(), "down")
+
+    def test_status_handles_stopiteration(self) -> None:
+        # Expect ping every midnight, default grace is 1 hour
+        check = Check()
+        check.kind = "oncalendar"
+        check.schedule = "2019-01-01"
+        check.status = "up"
+        check.last_ping = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+        with patch("hc.api.models.now") as mock_now:
+            mock_now.return_value = check.last_ping + td(hours=1)
+            self.assertEqual(check.get_status(), "up")
+
+    def test_status_works_with_timezone(self) -> None:
+        dt = datetime(2000, 1, 1, tzinfo=timezone.utc)
         # Expect ping every day at 10am, default grace is 1 hour
         check = Check()
         check.kind = "cron"
@@ -163,8 +193,7 @@ class CheckModelTestCase(BaseTestCase):
         self.assertEqual(check.get_status(), "down")
 
     def test_next_ping_with_cron_syntax(self) -> None:
-        dt = make_aware(datetime(2000, 1, 1), timezone=timezone.utc)
-
+        dt = datetime(2000, 1, 1, tzinfo=timezone.utc)
         # Expect ping every round hour
         check = Check(project=self.project)
         check.kind = "cron"
@@ -348,13 +377,20 @@ class CheckModelTestCase(BaseTestCase):
     @override_settings(S3_BUCKET=None)
     def test_it_prunes(self) -> None:
         check = Check.objects.create(project=self.project, n_pings=101)
-        Ping.objects.create(owner=check, n=101)
-        Ping.objects.create(owner=check, n=1)
+        Ping.objects.create(owner=check, created=CURRENT_TIME, n=101)
+        Ping.objects.create(owner=check, created=CURRENT_TIME, n=1)
+
+        f = Flip(owner=check)
+        # older than the earliest ping, and also older than 93 days
+        f.created = CURRENT_TIME - td(days=93, seconds=1)
+        f.old_status = "new"
+        f.new_status = "down"
+        f.save()
 
         n = Notification(owner=check)
         n.channel = Channel.objects.create(project=self.project, kind="email")
         n.check_status = "down"
-        n.created = check.created - td(minutes=10)
+        n.created = CURRENT_TIME - td(minutes=10)
         n.save()
 
         check.prune()
@@ -363,6 +399,41 @@ class CheckModelTestCase(BaseTestCase):
         self.assertFalse(Ping.objects.filter(n=1).exists())
 
         self.assertEqual(Notification.objects.count(), 0)
+        self.assertEqual(Flip.objects.count(), 0)
+
+    @override_settings(S3_BUCKET=None)
+    @patch("hc.api.models.now", MOCK_NOW)
+    def test_it_does_not_prune_flips_less_than_93_days_old(self) -> None:
+        check = Check.objects.create(project=self.project, n_pings=101)
+        Ping.objects.create(owner=check, n=101)
+
+        f = Flip(owner=check)
+        # older than the earliest ping, but not older than 93 days
+        f.created = CURRENT_TIME - td(days=92)
+        f.old_status = "new"
+        f.new_status = "down"
+        f.save()
+
+        check.prune()
+
+        self.assertEqual(Flip.objects.count(), 1)
+
+    @override_settings(S3_BUCKET=None)
+    def test_it_does_not_prune_flips_newer_than_the_earliest_ping(self) -> None:
+        check = Check.objects.create(project=self.project, n_pings=101)
+        Ping.objects.create(owner=check, n=101)
+        Ping.objects.create(owner=check, n=100, created=CURRENT_TIME - td(days=100))
+
+        f = Flip(owner=check)
+        # older than 93 days, but not older than the earliest ping
+        f.created = CURRENT_TIME - td(days=92)
+        f.old_status = "new"
+        f.new_status = "down"
+        f.save()
+
+        check.prune()
+
+        self.assertEqual(Flip.objects.count(), 1)
 
     @override_settings(S3_BUCKET="test-bucket")
     @patch("hc.api.models.remove_objects")
@@ -375,3 +446,38 @@ class CheckModelTestCase(BaseTestCase):
         code, upto_n = remove_objects.call_args.args
         self.assertEqual(code, str(check.code))
         self.assertEqual(upto_n, 1)
+
+    def test_get_grace_start_returns_utc(self) -> None:
+        check = Check(project=self.project)
+        check.kind = "cron"
+        check.schedule = "15 * * * *"
+        check.tz = "Europe/Riga"
+        check.last_ping = datetime(2023, 10, 29, 0, 55, tzinfo=timezone.utc)
+        check.status = "up"
+
+        gs = check.get_grace_start()
+        assert gs
+        self.assertEqual(gs.tzinfo, timezone.utc)
+
+    def test_get_status_handles_autumn_dst_transition(self) -> None:
+        check = Check(project=self.project)
+        check.kind = "cron"
+        check.schedule = "15 * * * *"
+        check.grace = td(minutes=5)
+        check.tz = "Europe/Riga"
+        check.last_ping = datetime(2023, 10, 29, 0, 55, tzinfo=timezone.utc)
+        check.status = "up"
+
+        with patch("hc.api.models.now") as mock_now:
+            mock_now.return_value = datetime(2023, 10, 29, 1, 5, tzinfo=timezone.utc)
+            # The next expected run time is at 2023-10-29 01:15 UTC, so the check
+            # should still be up for 10 minutes:
+            self.assertEqual(check.get_status(), "up")
+
+    def test_lock_and_delete_handles_already_deleted_checks(self) -> None:
+        check = Check.objects.create(project=self.project)
+        same_check = Check.objects.get(id=check.id)
+        check.delete()
+
+        # lock_and_delete should handle an already deleted check gracefully:
+        same_check.lock_and_delete()

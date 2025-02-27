@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from datetime import timedelta as td
 from secrets import token_urlsafe
@@ -35,12 +36,14 @@ from django.views.decorators.http import require_POST
 
 from hc.accounts import forms
 from hc.accounts.decorators import require_sudo_mode
+from hc.accounts.http import AuthenticatedHttpRequest
 from hc.accounts.models import Credential, Member, Profile, Project
 from hc.api.models import Channel, Check, TokenBucket
-from hc.lib.typealias import AuthenticatedHttpRequest
 from hc.lib.tz import all_timezones
 from hc.lib.webauthn import CreateHelper, GetHelper
 from hc.payments.models import Subscription
+
+logger = logging.getLogger(__name__)
 
 POST_LOGIN_ROUTES = (
     "hc-checks",
@@ -170,8 +173,7 @@ def _set_autologin_cookie(response: HttpResponse) -> None:
 @sensitive_post_parameters()
 def login(request: HttpRequest) -> HttpResponse:
     form = forms.PasswordLoginForm()
-    magic_form = forms.EmailLoginForm(request)
-
+    magic_form = forms.EmailLoginForm()
     if request.method == "POST":
         if request.POST.get("action") == "login":
             form = forms.PasswordLoginForm(request.POST)
@@ -206,6 +208,7 @@ def login(request: HttpRequest) -> HttpResponse:
         "registration_open": settings.REGISTRATION_OPEN,
         "support_email": settings.SUPPORT_EMAIL,
         "account_closed": "account-closed" in request.GET,
+        "use_magic_form": bool(settings.EMAIL_HOST),
     }
     return render(request, "accounts/login.html", ctx)
 
@@ -232,11 +235,20 @@ def signup(request: HttpRequest) -> HttpResponse:
     form = forms.SignupForm(request)
     if form.is_valid():
         email = form.cleaned_data["identity"]
-        if not User.objects.filter(email=email).exists():
+        try:
+            user = User.objects.get(email=email)
+            # Sometimes existing users forget they already have an account.
+            # They use the signup form and are confused why no email arrives.
+            # To avoid this confusion, if we see the user account already exists,
+            # we will send them sign-in link even though they used the wrong form
+            # ("sign up" instead of "sign in").
+        except User.DoesNotExist:
+            # If the user does not exist, create a new user account.
             tz = form.cleaned_data["tz"]
             user = _make_user(email, tz)
-            profile = Profile.objects.for_user(user)
-            profile.send_instant_login_link()
+
+        profile = Profile.objects.for_user(user)
+        profile.send_instant_login_link()
     else:
         ctx = {"form": form}
 
@@ -709,6 +721,8 @@ def close(request: AuthenticatedHttpRequest) -> HttpResponse:
 @login_required
 def remove_project(request: AuthenticatedHttpRequest, code: str) -> HttpResponse:
     project = get_object_or_404(Project, code=code, owner=request.user)
+    for check in project.check_set.all():
+        check.lock_and_delete()
     project.delete()
     return redirect("hc-index")
 
@@ -728,8 +742,10 @@ def add_webauthn(request: AuthenticatedHttpRequest) -> HttpResponse:
             return HttpResponseBadRequest()
 
         state = request.session["state"]
-        credential_bytes = helper.verify(state, form.cleaned_data["response"])
-        if credential_bytes is None:
+        try:
+            credential_bytes = helper.verify(state, form.cleaned_data["response"])
+        except ValueError:
+            logger.exception("CreateHelper.verify failed, form: %s", form.cleaned_data)
             return HttpResponseBadRequest()
 
         c = Credential(user=request.user)
@@ -927,7 +943,7 @@ def appearance(request: AuthenticatedHttpRequest) -> HttpResponse:
 
     if request.method == "POST":
         theme = request.POST.get("theme", "")
-        if theme in ("", "dark"):
+        if theme in ("", "dark", "system"):
             profile.theme = theme
             profile.save()
             ctx["status"] = "info"

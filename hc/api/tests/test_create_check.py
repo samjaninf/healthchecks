@@ -174,7 +174,7 @@ class CreateCheckTestCase(BaseTestCase):
         self.assertFalse(Check.objects.exists())
 
     def test_it_rejects_non_string_channels_key(self) -> None:
-        r = self.post({"channels": 123}, expect_fragment="channels is not a string")
+        self.post({"channels": 123}, expect_fragment="channels is not a string")
 
     def test_it_supports_unique_name(self) -> None:
         check = Check.objects.create(project=self.project, name="Foo")
@@ -314,7 +314,7 @@ class CreateCheckTestCase(BaseTestCase):
     def test_it_validates_cron_expression(self) -> None:
         r = self.post(
             {"schedule": "bad-expression", "tz": "Europe/Riga", "grace": 60},
-            expect_fragment="schedule is not a valid cron expression",
+            expect_fragment="schedule is not a valid cron or OnCalendar expression",
         )
         self.assertEqual(r.status_code, 400)
 
@@ -330,6 +330,32 @@ class CreateCheckTestCase(BaseTestCase):
         r = self.post(
             {"schedule": "* * * * *", "tz": "not-a-timezone", "grace": 60},
             expect_fragment="tz is not a valid timezone",
+        )
+        self.assertEqual(r.status_code, 400)
+
+    def test_it_converts_legacy_timezone(self) -> None:
+        for old, new in [("Europe/Kiev", "Europe/Kyiv"), ("UCT", "Etc/UTC")]:
+            r = self.post({"schedule": "* * * * *", "tz": old, "grace": 60})
+            self.assertEqual(r.status_code, 201)
+
+            doc = r.json()
+            self.assertEqual(doc["tz"], new)
+
+    def test_it_supports_oncalendar_syntax(self) -> None:
+        r = self.post({"schedule": "12:34", "tz": "Europe/Riga", "grace": 60})
+        self.assertEqual(r.status_code, 201)
+
+        doc = r.json()
+        self.assertEqual(doc["schedule"], "12:34")
+        self.assertEqual(doc["tz"], "Europe/Riga")
+        self.assertEqual(doc["grace"], 60)
+
+        self.assertTrue("timeout" not in doc)
+
+    def test_it_validates_oncalendar_expression(self) -> None:
+        r = self.post(
+            {"schedule": "12:34\nsurprise", "tz": "Europe/Riga", "grace": 60},
+            expect_fragment="schedule is not a valid cron or OnCalendar expression",
         )
         self.assertEqual(r.status_code, 400)
 
@@ -370,7 +396,7 @@ class CreateCheckTestCase(BaseTestCase):
 
     def test_it_rejects_non_boolean_filter_flags(self) -> None:
         for s in ("filter_subject", "filter_body"):
-            r = self.post({s: "surprise"}, expect_fragment=f"{s} is not a boolean")
+            self.post({s: "surprise"}, expect_fragment=f"{s} is not a boolean")
 
     def test_it_sets_methods(self) -> None:
         r = self.post({"methods": "POST"})
@@ -380,13 +406,13 @@ class CreateCheckTestCase(BaseTestCase):
         self.assertEqual(check.methods, "POST")
 
     def test_it_rejects_bad_methods_value(self) -> None:
-        r = self.post(
+        self.post(
             {"methods": "bad-value"}, expect_fragment="methods has unexpected value"
         )
 
     def test_it_rejects_long_filtering_keywords(self) -> None:
         for s in ("subject", "subject_fail", "start_kw", "success_kw", "failure_kw"):
-            r = self.post({s: "A" * 201}, expect_fragment=f"{s} is too long")
+            self.post({s: "A" * 201}, expect_fragment=f"{s} is too long")
 
     def test_it_sets_success_kw(self) -> None:
         r = self.post({"subject": "SUCCESS,COMPLETE"})
@@ -437,8 +463,13 @@ class CreateCheckTestCase(BaseTestCase):
 
     def test_it_handles_invalid_slug(self) -> None:
         for slug in ["Uppercase", "special!", "look spaces"]:
-            r = self.post({"name": "Foo", "slug": "Hey!"}, v=3)
+            r = self.post({"name": "Foo", "slug": slug}, v=3)
             self.assertEqual(r.status_code, 400)
             self.assertEqual(
                 r.json()["error"], "json validation error: slug does not match pattern"
             )
+
+    def test_it_rejects_long_slug(self) -> None:
+        r = self.post(
+            {"name": "Foo", "slug": "a" * 101}, v=3, expect_fragment="slug is too long"
+        )
